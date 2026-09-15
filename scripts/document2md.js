@@ -3,13 +3,7 @@ const API_URL = "https://api.chen-group.cn/v1/document2md";
 const API_KEY = Services.env.get("CHEN_GROUP_API_KEY")
     || Services.env.get("CHEN_GROUP_API_KEY_MEMBER");
 const API_PROFILE = Services.env.get("DOCUMENT2MD_PROFILE");
-const BATCH_CONCURRENCY = API_PROFILE === "server" ? 2 : 1;
-const IMAGE_WRITE_CONCURRENCY = 2;
 const SERVER_POLL_INTERVAL_MS = 5000;
-
-const SYNC_ATTACHMENTS_TRIGGER = (
-    typeof triggerType !== "undefined" && triggerType === "syncAttachments"
-);
 
 const STATUS_PROCESSING = "@md-处理中";
 const STATUS_SUCCESS = "@md-已生成";
@@ -39,8 +33,6 @@ const SOURCE_EXTENSIONS = new Set([
 ]);
 const IMAGE_EXTENSIONS = "bmp|jpeg|jpg|png|tif|tiff|webp";
 const GENERATED_IMAGE_PATTERN = new RegExp(`_fig_\\d{3,}\\.(?:${IMAGE_EXTENSIONS})$`, "i");
-let activeImageWrites = 0;
-const imageWriteWaiters = [];
 
 
 function getInvocationItems() {
@@ -198,16 +190,6 @@ function buildScopes(selectedItems) {
 }
 
 
-function hasTag(item, tag) {
-    return item.getTags().some(value => value.tag === tag);
-}
-
-
-function currentStatus(item) {
-    return MD_STATUSES.find(tag => hasTag(item, tag)) || null;
-}
-
-
 async function setStatus(item, status) {
     for (const tag of MD_STATUSES) {
         item.removeTag(tag);
@@ -283,26 +265,14 @@ async function cleanupStaleMarkdownAttachments(literature) {
     }
 }
 
-
-async function withImageWriteSlot(operation) {
-    if (activeImageWrites < IMAGE_WRITE_CONCURRENCY) {
-        activeImageWrites++;
-    }
-    else {
-        await new Promise(resolve => imageWriteWaiters.push(resolve));
-    }
-
+function removeTemporaryDirectory(directory) {
     try {
-        return await operation();
+        if (directory && directory.exists()) {
+            directory.remove(true);
+        }
     }
-    finally {
-        const next = imageWriteWaiters.shift();
-        if (next) {
-            next();
-        }
-        else {
-            activeImageWrites--;
-        }
+    catch (error) {
+        Zotero.logError(error);
     }
 }
 
@@ -338,9 +308,7 @@ async function writeMarkdownAttachment(item, attachmentIndex, filename, markdown
             });
         }
         finally {
-            if (directory.exists()) {
-                directory.remove(true);
-            }
+            removeTemporaryDirectory(directory);
         }
         attachmentIndex.set(key, [result]);
     }
@@ -578,35 +546,10 @@ async function generatedSidecars(storageDirectory) {
     return names;
 }
 
-
-async function referencedLegacyFigures(attachmentIndex, markdownName) {
-    const markdownAttachments = attachmentIndex.get(markdownName.toLowerCase()) || [];
-    if (markdownAttachments.length > 1) {
-        throw new Error(`输出附件重名：${markdownName}`);
-    }
-    if (!markdownAttachments.length) {
-        return new Set();
-    }
-
-    const markdown = (await IOUtils.readUTF8(
-        markdownAttachments[0].getFilePath()
-    )).toLowerCase();
-    const names = new Set();
-    for (const name of attachmentIndex.keys()) {
-        if (GENERATED_IMAGE_PATTERN.test(name) && markdown.includes(name)) {
-            names.add(name);
-        }
-    }
-    return names;
-}
-
-
 async function cleanupGeneratedAssets(
-    attachmentIndex,
     storageDirectory,
     oldSidecars,
-    keepNames,
-    legacyNames
+    keepNames
 ) {
     const keep = new Set([...keepNames].map(name => name.toLowerCase()));
 
@@ -617,21 +560,6 @@ async function cleanupGeneratedAssets(
             });
         }
     }
-
-    const legacyAttachmentIDs = [];
-    const migrate = new Set([
-        ...legacyNames,
-        ...keep,
-    ]);
-    for (const name of migrate) {
-        const attachments = attachmentIndex.get(name) || [];
-        for (const attachment of attachments) {
-            legacyAttachmentIDs.push(attachment.id);
-        }
-    }
-    if (legacyAttachmentIDs.length) {
-        await Zotero.Items.erase(legacyAttachmentIDs);
-    }
 }
 
 
@@ -639,7 +567,6 @@ async function writeConvertedDocument(item, sourceName, document) {
     const assets = document.assets || {};
     const attachmentIndex = buildAttachmentIndex(item);
     const markdownName = `${sourceName}.md`;
-    const legacyNames = await referencedLegacyFigures(attachmentIndex, markdownName);
     let markdownAttachment;
 
     try {
@@ -658,80 +585,49 @@ async function writeConvertedDocument(item, sourceName, document) {
     const oldSidecars = await generatedSidecars(storageDirectory);
     const keepNames = new Set();
     const filenames = Object.keys(assets);
-    let nextIndex = 0;
-    let assetError = null;
 
-    async function runImageWorker() {
-        while (!assetError) {
-            const index = nextIndex++;
-            if (index >= filenames.length) {
-                return;
-            }
-
-            const filename = filenames[index];
-            if (filename !== leafName(filename)) {
-                assetError = markError(
-                    new Error(`图片文件名无效：${filename}`),
-                    "service",
-                    `检查图片 ${filename}`,
-                    sourceName
-                );
-                return;
-            }
-
-            keepNames.add(filename);
-            try {
-                const path = PathUtils.join(storageDirectory.path, filename);
-                await withImageWriteSlot(async () => {
-                    let blob;
-                    try {
-                        blob = await downloadAsset(assets[filename]);
-                    }
-                    catch (error) {
-                        throw markError(
-                            error,
-                            "service",
-                            `下载图片 ${filename}`,
-                            sourceName
-                        );
-                    }
-                    try {
-                        await Zotero.File.putContentsAsync(path, blob);
-                    }
-                    catch (error) {
-                        throw markError(
-                            error,
-                            "local",
-                            `写入图片 ${filename}`,
-                            sourceName
-                        );
-                    }
-                });
-            }
-            catch (error) {
-                assetError = error;
-                return;
-            }
+    for (const filename of filenames) {
+        if (filename !== leafName(filename)) {
+            throw markError(
+                new Error(`图片文件名无效：${filename}`),
+                "service",
+                `检查图片 ${filename}`,
+                sourceName
+            );
         }
-    }
 
-    await Promise.all(
-        Array.from(
-            { length: Math.min(IMAGE_WRITE_CONCURRENCY, filenames.length) },
-            runImageWorker
-        )
-    );
-    if (assetError) {
-        throw assetError;
+        keepNames.add(filename);
+        const path = PathUtils.join(storageDirectory.path, filename);
+        let blob;
+        try {
+            blob = await downloadAsset(assets[filename]);
+        }
+        catch (error) {
+            throw markError(
+                error,
+                "service",
+                `下载图片 ${filename}`,
+                sourceName
+            );
+        }
+        try {
+            await Zotero.File.putContentsAsync(path, blob);
+        }
+        catch (error) {
+            throw markError(
+                error,
+                "local",
+                `写入图片 ${filename}`,
+                sourceName
+            );
+        }
     }
 
     try {
         await cleanupGeneratedAssets(
-            attachmentIndex,
             storageDirectory,
             oldSidecars,
-            keepNames,
-            legacyNames
+            keepNames
         );
     }
     catch (error) {
@@ -748,7 +644,6 @@ async function writeConvertedDocument(item, sourceName, document) {
         throw markError(error, "local", "标记附件同步", sourceName);
     }
 
-    return filenames.length;
 }
 
 
@@ -768,15 +663,6 @@ function duplicateSourceNames(sources) {
 
 async function processScope(scope) {
     const { literature, allSources, sources } = scope;
-    const previousStatus = currentStatus(literature);
-    let imageCount = 0;
-
-    function finish(result) {
-        return {
-            ...result,
-            imageCount,
-        };
-    }
 
     try {
         await cleanupStaleMarkdownAttachments(literature);
@@ -784,37 +670,32 @@ async function processScope(scope) {
     catch (error) {
         logError(error);
         await setStatus(literature, STATUS_FAILED);
-        return finish({
+        return {
             status: "failed",
             details: [`清理旧 Markdown｜${errorMessage(error)}`],
             stopBatch: true,
-        });
+        };
     }
 
-    if (
-        previousStatus === STATUS_PROCESSING
-        || (
-            previousStatus === STATUS_SUCCESS
-            && allSourcesHaveMarkdown(literature)
-        )
-    ) {
-        return finish({ status: "skipped" });
+    if (allSourcesHaveMarkdown(literature)) {
+        await setStatus(literature, STATUS_SUCCESS);
+        return { status: "skipped" };
     }
     if (!sources.length) {
         await setStatus(literature, STATUS_SKIPPED);
-        return finish({
+        return {
             status: "skipped",
             details: ["没有可处理的文件附件"],
-        });
+        };
     }
 
     const duplicates = duplicateSourceNames(sources);
     if (duplicates.length) {
         await setStatus(literature, STATUS_FAILED);
-        return finish({
+        return {
             status: "failed",
             details: [`源附件文件名重复：${duplicates.join("、")}`],
-        });
+        };
     }
 
     await setStatus(literature, STATUS_PROCESSING);
@@ -828,7 +709,7 @@ async function processScope(scope) {
     for (const { attachment, file } of sources) {
         try {
             const document = await convertFile(file, attachment);
-            imageCount += await writeConvertedDocument(literature, file.name, document);
+            await writeConvertedDocument(literature, file.name, document);
             referenceReview = referenceReview || document.reference_review === true;
         }
         catch (error) {
@@ -839,164 +720,37 @@ async function processScope(scope) {
 
             if (error.kind !== "file") {
                 await setStatus(literature, STATUS_FAILED);
-                return finish({
+                return {
                     status: "failed",
                     details: failures,
                     stopBatch: true,
-                });
+                };
             }
         }
     }
 
     if (failures.length) {
         await setStatus(literature, STATUS_FAILED);
-        return finish({
+        return {
             status: "failed",
             details: failures,
-        });
+        };
     }
 
     if (referenceReview) {
         literature.addTag(STATUS_REFERENCE_REVIEW);
     }
 
-    if (allSources) {
-        await setStatus(literature, STATUS_SUCCESS);
-    }
-    else {
-        await setStatus(
-            literature,
-            previousStatus === STATUS_FAILED ? STATUS_FAILED : null
-        );
-    }
-
-    return finish({
-        status: "success",
-        referenceReview,
-    });
-}
-
-
-function formatDuration(milliseconds) {
-    const seconds = milliseconds / 1000;
-    if (seconds < 60) {
-        return `${seconds.toFixed(1)}秒`;
-    }
-    return `${Math.floor(seconds / 60)}分${(seconds % 60).toFixed(1)}秒`;
-}
-
-
-function formatSeconds(milliseconds) {
-    return (milliseconds / 1000).toFixed(1);
-}
-
-
-function formatShanghaiTime(timestamp) {
-    return new Date(timestamp).toLocaleTimeString("zh-CN", {
-        hour12: false,
-        timeZone: "Asia/Shanghai",
-    });
-}
-
-
-function createBatchProgress(total, startedAt, processTotal) {
-    const progress = new Zotero.ProgressWindow();
-    progress.changeHeadline(`转为MD 0/${total}`);
-    const progressLine = new progress.ItemProgress(null, "处理中");
-    const literatureLine = new progress.ItemProgress(null, "");
-    const timingLine = new progress.ItemProgress(null, "平均 0.0秒｜图片 0");
-    progressLine.setProgress(0);
-    progress.show();
-    return {
-        progress,
-        progressLine,
-        literatureLine,
-        timingLine,
-        startedAt,
-        processTotal,
-        processed: 0,
-        averageMs: 0,
-    };
-}
-
-
-function updateBatchProgress(batchProgress, completed, total, title, result) {
-    const percent = total ? completed * 100 / total : 100;
-    if (result.status !== "skipped") {
-        batchProgress.processed++;
-        batchProgress.averageMs = (
-            Date.now() - batchProgress.startedAt
-        ) / batchProgress.processed;
-    }
-    const averageMs = batchProgress.averageMs;
-    const remaining = Math.max(0, batchProgress.processTotal - batchProgress.processed);
-    const estimatedAt = averageMs ? Date.now() + averageMs * remaining : null;
-    batchProgress.progress.changeHeadline(`转为MD ${completed}/${total}`);
-    batchProgress.progressLine.setProgress(percent);
-    batchProgress.progressLine.setText("处理中");
-    batchProgress.literatureLine.setText(title);
-    batchProgress.timingLine.setText(
-        `预计 ${estimatedAt ? formatShanghaiTime(estimatedAt) : "--:--:--"}｜平均 ${formatSeconds(averageMs)}秒｜图片 ${result.imageCount}`
+    await setStatus(
+        literature,
+        allSourcesHaveMarkdown(literature) ? STATUS_SUCCESS : null
     );
+
+    return { status: "success" };
 }
 
-
-function showProgressWindow(headline, descriptions) {
-    const progress = new Zotero.ProgressWindow();
-    progress.changeHeadline(headline);
-    for (const description of descriptions) {
-        progress.addDescription(description);
-    }
-    progress.show();
-}
-
-
-function escapeHtml(value) {
-    return String(value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-}
-
-
-function showSummary(batchProgress, summary) {
-    const progress = batchProgress.progress;
-    progress.changeHeadline("转为MD");
-    batchProgress.progressLine.setProgress(95);
-    batchProgress.progressLine.setText("完成");
-    batchProgress.literatureLine.setProgress(100);
-    batchProgress.literatureLine.setText(
-        `总计 ${summary.total}｜成功 ${summary.success}｜待复核 ${summary.reviewItems.length}｜跳过 ${summary.skipped}｜失败 ${summary.failed}`
-    );
-    batchProgress.timingLine.setProgress(100);
-    batchProgress.timingLine.setText(
-        `总耗时 ${formatDuration(summary.elapsedMs)}｜图片 ${summary.imageCount}`
-    );
-    for (const detail of summary.details) {
-        progress.addDescription(detail);
-    }
-    for (const entry of summary.reviewItems) {
-        progress.addDescription("待复核");
-        progress.addDescription(
-            `<a href="zotero://select/library/items/${entry.itemKey}">${escapeHtml(entry.title)}</a>`
-        );
-    }
-    if (!summary.reviewItems.length) {
-        progress.startCloseTimer(summary.failed ? 8000 : 3500);
-    }
-    return [
-        `总计 ${summary.total}｜成功 ${summary.success}｜待复核 ${summary.reviewItems.length}｜跳过 ${summary.skipped}｜失败 ${summary.failed}`,
-        `总耗时 ${formatDuration(summary.elapsedMs)}｜图片 ${summary.imageCount}`,
-        ...summary.details,
-    ].join("\n");
-}
-
-
-let activeBatchProgress = null;
 
 await (async () => {
-    const batchStarted = Date.now();
     if (typeof item !== "undefined" && item) {
         return;
     }
@@ -1020,94 +774,30 @@ await (async () => {
         failed: 0,
         stopped: false,
         details: [],
-        reviewItems: [],
-        imageCount: 0,
     };
-    let completed = 0;
-    let nextIndex = 0;
-    const processTotal = scopes.filter(scope => {
-        const status = currentStatus(scope.literature);
-        return (
-            status !== STATUS_PROCESSING
-            && (
-                status !== STATUS_SUCCESS
-                || !allSourcesHaveMarkdown(scope.literature)
-            )
-        );
-    }).length;
-    if (!SYNC_ATTACHMENTS_TRIGGER) {
-        activeBatchProgress = createBatchProgress(
-            scopes.length,
-            batchStarted,
-            processTotal
-        );
-    }
 
-    async function runWorker() {
-        while (!summary.stopped) {
-            const index = nextIndex++;
-            if (index >= scopes.length) {
-                return;
-            }
+    for (const scope of scopes) {
+        if (summary.stopped) {
+            break;
+        }
 
-            const scope = scopes[index];
-            const result = await processScope(scope);
-            summary[result.status]++;
-            summary.imageCount += result.imageCount;
-            completed++;
+        const result = await processScope(scope);
+        summary[result.status]++;
 
+        if (result.status === "failed") {
             const title = scope.literature.getField("title") || scope.literature.id;
-            if (activeBatchProgress) {
-                updateBatchProgress(
-                    activeBatchProgress,
-                    completed,
-                    scopes.length,
-                    title,
-                    result
-                );
-            }
-
-            if (result.status === "failed") {
-                summary.details.push(`失败｜${title}｜${result.details.join("；")}`);
-                if (result.stopBatch && !summary.stopped) {
-                    summary.stopped = true;
-                    summary.details.push("检测到服务或本地写入错误，已停止后续文献处理");
-                }
-            }
-            else if (result.referenceReview) {
-                summary.reviewItems.push({
-                    itemKey: scope.literature.key,
-                    title: scope.literature.getField("title") || scope.literature.id,
-                });
+            summary.details.push(`失败｜${title}｜${result.details.join("；")}`);
+            if (result.stopBatch) {
+                summary.stopped = true;
             }
         }
     }
 
-    await Promise.all(
-        Array.from(
-            { length: Math.min(BATCH_CONCURRENCY, scopes.length) },
-            runWorker
-        )
-    );
-
-    summary.elapsedMs = Date.now() - batchStarted;
-    const message = SYNC_ATTACHMENTS_TRIGGER
-        ? `文献 ${summary.total}｜成功 ${summary.success}｜跳过 ${summary.skipped}｜失败 ${summary.failed}`
-        : showSummary(activeBatchProgress, summary);
-    if (!SYNC_ATTACHMENTS_TRIGGER) {
-        activeBatchProgress = null;
-    }
-    return message;
+    return [
+        `文献 ${summary.total}｜成功 ${summary.success}｜跳过 ${summary.skipped}｜失败 ${summary.failed}`,
+        ...summary.details,
+    ].join("\n");
 })().catch(error => {
-    if (activeBatchProgress) {
-        activeBatchProgress.progress.close();
-        activeBatchProgress = null;
-    }
-    if (!SYNC_ATTACHMENTS_TRIGGER) {
-        showProgressWindow(
-            "转为MD失败",
-            [errorMessage(error)]
-        );
-    }
     Zotero.logError(error);
+    throw error;
 });

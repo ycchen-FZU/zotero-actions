@@ -116,75 +116,16 @@ function sourceItemLink(item) {
 }
 
 
-function collectCollectionProgress(source, itemIDs, collectionIDs) {
-    collectionIDs.add(source.id);
-    for (const item of source.getChildItems(false, false)) {
-        if (item && item.isRegularItem() && !item.deleted) {
-            itemIDs.add(item.id);
-        }
-    }
-    for (const child of Zotero.Collections.getByParent(source.id, false)) {
-        collectCollectionProgress(child, itemIDs, collectionIDs);
-    }
-}
-
-
-async function getProgressTotal(scope) {
-    const itemIDs = new Set();
-    const collectionIDs = new Set();
-
-    if (scope.kind === "items") {
-        for (const item of scope.literature) {
-            itemIDs.add(item.id);
-        }
-    }
-    else if (scope.kind === "collection") {
-        let parentID = scope.collection.parentID;
-        while (parentID) {
-            const parent = Zotero.Collections.get(parentID);
-            if (!parent) {
-                break;
-            }
-            collectionIDs.add(parent.id);
-            parentID = parent.parentID;
-        }
-        collectCollectionProgress(scope.collection, itemIDs, collectionIDs);
-    }
-    else {
-        for (const item of await Zotero.Items.getAll(
-            Zotero.Libraries.userLibraryID,
-            false,
-            false,
-            false
-        )) {
-            if (item && item.isRegularItem() && !item.deleted) {
-                itemIDs.add(item.id);
-            }
-        }
-        for (const root of Zotero.Collections.getByLibrary(
-            Zotero.Libraries.userLibraryID,
-            false
-        )) {
-            collectCollectionProgress(root, itemIDs, collectionIDs);
-        }
-    }
-
-    return itemIDs.size + collectionIDs.size;
-}
-
-
-function createProgress(total) {
+function createProgress() {
     const progress = new Zotero.ProgressWindow();
-    progress.changeHeadline(`同步到课题组 0/${total}`);
+    progress.changeHeadline("同步到课题组 0");
     const statusLine = new progress.ItemProgress(null, "处理中");
     const titleLine = new progress.ItemProgress(null, "");
-    statusLine.setProgress(0);
     progress.show();
     return {
         progress,
         statusLine,
         titleLine,
-        total,
         itemIDs: new Set(),
         collectionIDs: new Set(),
     };
@@ -197,13 +138,7 @@ function updateProgress(context, type, source, label) {
         : context.batch.collectionIDs;
     ids.add(source.id);
     const completed = context.batch.itemIDs.size + context.batch.collectionIDs.size;
-    const percent = context.batch.total
-        ? Math.min(completed * 100 / context.batch.total, 99.9)
-        : 0;
-    context.batch.progress.changeHeadline(
-        `同步到课题组 ${completed}/${context.batch.total}`
-    );
-    context.batch.statusLine.setProgress(percent);
+    context.batch.progress.changeHeadline(`同步到课题组 ${completed}`);
     context.batch.statusLine.setText("处理中");
     context.batch.titleLine.setText(label);
 }
@@ -512,7 +447,7 @@ let activeBatch = null;
 
     const scope = await resolveScope();
     const group = targetGroup();
-    const batch = createProgress(await getProgressTotal(scope));
+    const batch = createProgress();
     activeBatch = batch;
     const summary = {
         created: 0,

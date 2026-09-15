@@ -45,12 +45,13 @@
 
 ```text
 DOCUMENT2MD_PROFILE=local|server
-CHEN_GROUP_API_KEY=<开发者/Admin>
+CHEN_GROUP_API_KEY=<老师/开发环境>
 CHEN_GROUP_API_KEY_MEMBER=<普通成员>
 ```
 
 需要访问服务器的脚本优先读取 `CHEN_GROUP_API_KEY`，不存在时读取
-`CHEN_GROUP_API_KEY_MEMBER`。学生固定使用 `DOCUMENT2MD_PROFILE=server`。
+`CHEN_GROUP_API_KEY_MEMBER`。两者当前服务器权限相同，仅用于区分保密范围和分发对象。
+学生固定使用 `DOCUMENT2MD_PROFILE=server`。
 
 ## 同步附件
 
@@ -66,6 +67,7 @@ PUT https://api.chen-group.cn/v1/attachments?doi=...&kind=pdf|bundle
 - 缺 PDF 时由 paper-service 检索全文；缺 Markdown 时调用隐藏 `document2md`。
 - 本地生成而服务器缺失的 PDF/bundle 会上传；服务器缓存不由客户端覆盖或删除。
 - bundle 保持 Markdown 和 `d2md_fig_*` 原文件名。
+- 附件接口限流返回 429；客户端对 429/503 每 500 ms 重试，最多 10 次。
 
 ## 同步到课题组
 
@@ -82,23 +84,23 @@ PUT https://api.chen-group.cn/v1/attachments?doi=...&kind=pdf|bundle
 
 - `document2md.js` 是唯一文档转 Markdown+FIG 实现。
 - `sync-attachments.js` 通过 `dispatchActionByKey()` 调用它。
-- 进度和汇总使用 `Zotero.ProgressWindow`。
-- 确认和选择使用 `Services.prompt`。
-- 不使用浏览器原生 `alert()`、`confirm()`、`prompt()`。
+- `document2md.js` 为隐藏 Action，不显示独立进度或汇总，转换任务串行执行。
+- “同步附件”以 5 路并发准备全文，单线程持续消费需要转换的 PDF。
+- `document2md` 保留 `local` / `server` 两种后端。
+- 显式 Action 的进度使用 `Zotero.ProgressWindow`，确认和选择使用 `Services.prompt`。
 - 一次性迁移或修复脚本完成并核验后不长期保留。
 
 ## 学生安装器
 
-`install.cmd` 调用 `installer.ps1`。安装器要求 Zotero 已关闭，并完成：
+`install.cmd` 调用 `installer.ps1`。若 Zotero 正在运行，安装器记录实际可执行文件路径、
+正常关闭 Zotero，并在安装完成后从原路径重新启动；若原本未运行，则保持未运行。
 
-1. 定位默认 Zotero Profile。
-2. 检查 Actions & Tags 是否已安装。
-3. 备份 `prefs.js`。
-4. 按固定 Action Key 安装或更新“同步附件”和隐藏 `document2md`，并维护
-   `extensions.actionsTags.rules` 索引。
-5. 写入用户环境变量 `DOCUMENT2MD_PROFILE=server` 和 `CHEN_GROUP_API_KEY_MEMBER`。
+安装器定位默认 Profile、检查 Actions & Tags、备份 `prefs.js`，安装或更新“同步附件”
+和隐藏 `document2md`，并维护 `extensions.actionsTags.rules` 索引。
 
-重复运行安装器会更新原 Action，不会创建重复 Action。
+已有用户级 `CHEN_GROUP_API_KEY_MEMBER` 时先向附件服务验证；有效则直接复用，无效或不存在
+才提示输入，并验证新 Key 后写入。安装器同时设置 `DOCUMENT2MD_PROFILE=server`，并更新用户级
+及当前进程环境变量。重复运行只更新原 Action，不会创建重复项。
 
 Release 中的 `zotero-actions-student.zip` 只包含 README、安装器、`sync-attachments.js` 和 `document2md.js`。
 

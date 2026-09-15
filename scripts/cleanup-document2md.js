@@ -6,11 +6,6 @@ const STATUS_TAGS = [
     "@md-失败",
     "@ref-待复核",
 ];
-const IMAGE_EXTENSIONS = "bmp|jpeg|jpg|png|tif|tiff|webp";
-const GENERATED_FIG_PATTERN = new RegExp(
-    `_fig_\\d{3,}\\.(?:${IMAGE_EXTENSIONS})$`,
-    "i"
-);
 
 function getInvocationItems() {
     if (typeof items !== "undefined" && Array.isArray(items) && items.length) {
@@ -78,37 +73,8 @@ function isGeneratedMarkdown(attachment, name) {
     );
 }
 
-function isGeneratedFigure(name) {
-    return GENERATED_FIG_PATTERN.test(name);
-}
-
 function hasTag(item, tag) {
     return item.getTags().some(value => value.tag === tag);
-}
-
-function storageDirectoryPath(attachment) {
-    try {
-        return Zotero.Attachments.getStorageDirectory(attachment).path;
-    }
-    catch (error) {
-        return null;
-    }
-}
-
-async function removeEmptyStorageDirectories(paths) {
-    for (const path of paths) {
-        try {
-            if (
-                await IOUtils.exists(path)
-                && await Zotero.File.directoryIsEmpty(path)
-            ) {
-                await OS.File.removeEmptyDir(path);
-            }
-        }
-        catch (error) {
-            Zotero.logError(error);
-        }
-    }
 }
 
 async function cleanLiterature(literature) {
@@ -117,21 +83,15 @@ async function cleanLiterature(literature) {
         .filter(attachment => attachment && attachment.isAttachment());
 
     const generatedIDs = [];
-    const generatedStoragePaths = new Set();
     for (const attachment of attachments) {
         const name = attachmentName(attachment);
-        if (!name || (!isGeneratedMarkdown(attachment, name) && !isGeneratedFigure(name))) {
+        if (!name || !isGeneratedMarkdown(attachment, name)) {
             continue;
         }
         generatedIDs.push(attachment.id);
-        const storagePath = storageDirectoryPath(attachment);
-        if (storagePath) {
-            generatedStoragePaths.add(storagePath);
-        }
     }
     if (generatedIDs.length) {
         await Zotero.Items.erase(generatedIDs);
-        await removeEmptyStorageDirectories(generatedStoragePaths);
     }
 
     let removedTags = 0;

@@ -6,8 +6,11 @@ const API_KEY = Services.env.get("CHEN_GROUP_API_KEY")
 const IMAGE_EXTENSIONS = "bmp|jpeg|jpg|png|tif|tiff|webp";
 const GENERATED_FIG_PATTERN = new RegExp(`_fig_\\d{3,}\\.(?:${IMAGE_EXTENSIONS})$`, "i");
 const MD_STATUSES = ["@md-处理中", "@md-已生成", "@md-跳过", "@md-失败"];
-const SYNC_CONCURRENCY = 3;
+const FULLTEXT_CONCURRENCY = 5;
 const ATTACHMENTS_POLL_INTERVAL_MS = 2000;
+const RETRYABLE_HTTP_STATUSES = new Set([429, 503]);
+const HTTP_RETRY_DELAY_MS = 500;
+const HTTP_RETRY_LIMIT = 10;
 
 
 function getInvocationItems() {
@@ -175,9 +178,23 @@ function authHeaders(extra = {}) {
 }
 
 
+async function httpRequest(method, url, options) {
+    for (let attempt = 0; ; attempt++) {
+        const response = await Zotero.HTTP.request(method, url, options);
+        if (
+            !RETRYABLE_HTTP_STATUSES.has(response.status)
+            || attempt >= HTTP_RETRY_LIMIT
+        ) {
+            return response;
+        }
+        await new Promise(resolve => setTimeout(resolve, HTTP_RETRY_DELAY_MS));
+    }
+}
+
+
 async function getRemoteState(doi, cacheOnly = false) {
     const cacheOnlyQuery = cacheOnly ? "&cache_only=1" : "";
-    let response = await Zotero.HTTP.request(
+    let response = await httpRequest(
         "GET",
         `${ATTACHMENTS_API}?doi=${encodeURIComponent(doi)}${cacheOnlyQuery}`,
         {
@@ -197,7 +214,7 @@ async function getRemoteState(doi, cacheOnly = false) {
             throw new Error("附件服务未返回全文搜索任务 ID");
         }
         await new Promise(resolve => setTimeout(resolve, ATTACHMENTS_POLL_INTERVAL_MS));
-        response = await Zotero.HTTP.request(
+        response = await httpRequest(
             "GET",
             `${ATTACHMENTS_API}?doi=${encodeURIComponent(doi)}&job_id=${encodeURIComponent(jobID)}`,
             {
@@ -233,7 +250,7 @@ function isPdfBuffer(buffer) {
 
 
 async function downloadPdf(literature, key, url) {
-    const response = await Zotero.HTTP.request("GET", url, {
+    const response = await httpRequest("GET", url, {
         responseType: "arraybuffer",
         successCodes: false,
         timeout: 0,
@@ -255,9 +272,7 @@ async function downloadPdf(literature, key, url) {
         });
     }
     finally {
-        if (directory.exists()) {
-            directory.remove(true);
-        }
+        removeTemporaryDirectory(directory);
     }
 }
 
@@ -267,6 +282,18 @@ function nsFile(path) {
         .createInstance(Components.interfaces.nsIFile);
     file.initWithPath(path);
     return file;
+}
+
+
+function removeTemporaryDirectory(directory) {
+    try {
+        if (directory && directory.exists()) {
+            directory.remove(true);
+        }
+    }
+    catch (error) {
+        Zotero.logError(error);
+    }
 }
 
 
@@ -280,7 +307,7 @@ async function setMarkdownSuccess(literature) {
 
 
 async function installBundle(literature, doi) {
-    const response = await Zotero.HTTP.request(
+    const response = await httpRequest(
         "GET",
         `${ATTACHMENTS_API}?doi=${encodeURIComponent(doi)}&download=bundle`,
         {
@@ -322,9 +349,7 @@ async function installBundle(literature, doi) {
 
     const markdownFiles = extracted.filter(path => /\.md$/i.test(path));
     if (markdownFiles.length !== 1) {
-        if (directory.exists()) {
-            directory.remove(true);
-        }
+        removeTemporaryDirectory(directory);
         throw new Error("Bundle 中 Markdown 文件数量必须为 1");
     }
 
@@ -362,9 +387,7 @@ async function installBundle(literature, doi) {
         throw error;
     }
     finally {
-        if (directory.exists()) {
-            directory.remove(true);
-        }
+        removeTemporaryDirectory(directory);
     }
 }
 
@@ -411,7 +434,7 @@ async function createBundle(markdown) {
 
 async function uploadFile(doi, kind, path, contentType) {
     const body = await IOUtils.read(path);
-    const response = await Zotero.HTTP.request(
+    const response = await httpRequest(
         "PUT",
         `${ATTACHMENTS_API}?doi=${encodeURIComponent(doi)}&kind=${kind}`,
         {
@@ -429,28 +452,13 @@ async function uploadFile(doi, kind, path, contentType) {
 }
 
 
-let document2mdQueue = Promise.resolve();
-
-
 async function runDocument2md(pdf) {
-    const previous = document2mdQueue;
-    let release;
-    document2mdQueue = new Promise(resolve => {
-        release = resolve;
-    });
-    await previous;
-    try {
-        await Zotero.ActionsTags.api.actionManager.dispatchActionByKey(
-            DOCUMENT2MD_ACTION_KEY,
-            {
-                itemIDs: [pdf.id],
-                triggerType: "syncAttachments",
-            }
-        );
-    }
-    finally {
-        release();
-    }
+    await Zotero.ActionsTags.api.actionManager.dispatchActionByKey(
+        DOCUMENT2MD_ACTION_KEY,
+        {
+            itemIDs: [pdf.id],
+        }
+    );
 }
 
 
@@ -567,9 +575,80 @@ let activeBatch = null;
     const batch = createBatchProgress(literature.length);
     activeBatch = batch;
     let processed = 0;
+    let document2mdTail = Promise.resolve();
+
+    function finishItem(title) {
+        processed++;
+        updateBatchProgress(batch, processed, literature.length, title);
+    }
+
+    function addResult(changed) {
+        if (changed) {
+            summary.updated++;
+        }
+        else {
+            summary.unchanged++;
+        }
+    }
+
+    function addFailure(entry, error) {
+        summary.failed.push({
+            ...entry,
+            error: error && error.message ? error.message : String(error),
+        });
+        Zotero.logError(error);
+    }
+
+    function enqueueDocument2md(job) {
+        document2mdTail = document2mdTail.then(async () => {
+            const {
+                literatureItem,
+                title,
+                entry,
+                doi,
+                pdf,
+            } = job;
+            try {
+                updateBatchProgress(
+                    batch,
+                    processed,
+                    literature.length,
+                    title,
+                    "处理中 · Markdown 转换"
+                );
+                await runDocument2md(pdf);
+                const markdown = await localMarkdown(literatureItem, pdf);
+                if (!markdown) {
+                    throw new Error("document2md 未生成 Markdown");
+                }
+
+                updateBatchProgress(
+                    batch,
+                    processed,
+                    literature.length,
+                    title,
+                    "处理中 · 上传至服务器"
+                );
+                const bundle = await createBundle(markdown);
+                try {
+                    await uploadFile(doi, "bundle", bundle.path, "application/zip");
+                }
+                finally {
+                    removeTemporaryDirectory(bundle.directory);
+                }
+                addResult(true);
+            }
+            catch (error) {
+                addFailure(entry, error);
+            }
+            finally {
+                finishItem(title);
+            }
+        });
+    }
 
     let nextIndex = 0;
-    async function runWorker() {
+    async function runFulltextWorker() {
         while (true) {
             const index = nextIndex++;
             if (index >= literature.length) {
@@ -578,6 +657,7 @@ let activeBatch = null;
             const literatureItem = literature[index];
             const title = titleOf(literatureItem);
             const entry = { item: literatureItem, title };
+            let queuedForDocument2md = false;
             try {
                 updateBatchProgress(batch, processed, literature.length, title);
                 const doi = normalizeDoi(literatureItem.getField("DOI"));
@@ -585,10 +665,7 @@ let activeBatch = null;
                     summary.unchanged++;
                     continue;
                 }
-                const key = citationKey(literatureItem);
-                if (!key) {
-                    throw new Error("缺少 citationkey");
-                }
+                const key = citationKey(literatureItem) || literatureItem.key;
 
                 let changed = false;
                 let pdf = await localPdf(literatureItem);
@@ -619,7 +696,7 @@ let activeBatch = null;
                         );
                         const pdfPath = await pdf.getFilePathAsync();
                         const uploaded = await uploadFile(doi, "pdf", pdfPath, "application/pdf");
-                        changed = uploaded && uploaded.pdf === "created";
+                        changed = changed || Boolean(uploaded && uploaded.pdf === "created");
                     }
                 }
                 else {
@@ -666,19 +743,15 @@ let activeBatch = null;
                         changed = true;
                     }
                     else {
-                        updateBatchProgress(
-                            batch,
-                            processed,
-                            literature.length,
+                        enqueueDocument2md({
+                            literatureItem,
                             title,
-                            "处理中 · Markdown 转换"
-                        );
-                        await runDocument2md(pdf);
-                        markdown = await localMarkdown(literatureItem, pdf);
-                        if (!markdown) {
-                            throw new Error("document2md 未生成 Markdown");
-                        }
-                        changed = true;
+                            entry,
+                            doi,
+                            pdf,
+                        });
+                        queuedForDocument2md = true;
+                        continue;
                     }
                 }
 
@@ -695,40 +768,31 @@ let activeBatch = null;
                         await uploadFile(doi, "bundle", bundle.path, "application/zip");
                     }
                     finally {
-                        if (bundle.directory.exists()) {
-                            bundle.directory.remove(true);
-                        }
+                        removeTemporaryDirectory(bundle.directory);
                     }
                     changed = true;
                 }
 
-                if (changed) {
-                    summary.updated++;
-                }
-                else {
-                    summary.unchanged++;
-                }
+                addResult(changed);
             }
             catch (error) {
-                summary.failed.push({
-                    ...entry,
-                    error: error && error.message ? error.message : String(error),
-                });
-                Zotero.logError(error);
+                addFailure(entry, error);
             }
             finally {
-                processed++;
-                updateBatchProgress(batch, processed, literature.length, title);
+                if (!queuedForDocument2md) {
+                    finishItem(title);
+                }
             }
         }
     }
 
     await Promise.all(
         Array.from(
-            { length: Math.min(SYNC_CONCURRENCY, literature.length) },
-            runWorker
+            { length: Math.min(FULLTEXT_CONCURRENCY, literature.length) },
+            runFulltextWorker
         )
     );
+    await document2mdTail;
 
     showFinalSummary(batch, summary);
     activeBatch = null;

@@ -4,12 +4,11 @@
 
 ## 安装
 
-1. 安装 [Zotero Actions & Tags](https://github.com/windingwind/zotero-actions-tags/releases)。
-2. 下载并解压 [zotero-actions-student.zip](https://github.com/ycchen-FZU/zotero-actions/releases/latest/download/zotero-actions-student.zip)。
-3. 关闭 Zotero。
+1. 安装 [Zotero 10](https://www.zotero.org/download/)。
+2. 安装 [Zotero Actions & Tags](https://github.com/windingwind/zotero-actions-tags/releases)。
+3. 下载并解压 [zotero-actions-student.zip](https://github.com/ycchen-FZU/zotero-actions/releases/latest/download/zotero-actions-student.zip)。
 4. 双击 `install.cmd`。
-5. 按提示输入课题组提供的 API Key。
-6. 重新打开 Zotero。
+5. 按提示输入课题组 API Key。
 
 安装完成后，在“我的文库”中右键文献或 Collection，即可看到 **同步附件**。
 
@@ -35,16 +34,7 @@
 
 “同步附件”只在“我的文库”中运行。
 
-## 学生脚本
-
-| 脚本 | 学生 |
-| --- | :---: |
-| `sync-attachments.js` | ✅ |
-| `document2md.js` | ✅ |
-
-`document2md.js` 是“同步附件”的隐藏依赖，不需要手动运行。
-
 ## 更新
 
-下载新版 `zotero-actions-student.zip` 后，关闭 Zotero 并重新运行 `install.cmd`。
+下载新版 `zotero-actions-student.zip` 后，重新运行 `install.cmd` 即可。
 

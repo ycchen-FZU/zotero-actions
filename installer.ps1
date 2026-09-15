@@ -11,8 +11,52 @@ function Fail([string]$Message) {
     exit 1
 }
 
-if (Get-Process zotero -ErrorAction SilentlyContinue) {
-    Fail (Zh "6K+35YWI5YWz6ZetIFpvdGVyb++8jOWGjemHjeaWsOi/kOihjCBpbnN0YWxsLmNtZOOAgg==")
+function Test-MemberKey([string]$Key) {
+    if ([string]::IsNullOrWhiteSpace($Key)) {
+        return $false
+    }
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://api.chen-group.cn/v1/attachments?doi=10.5555/zotero-actions-key-check&cache_only=1" `
+            -Headers @{ Authorization = "Bearer $Key" } `
+            -TimeoutSec 15
+        return ([int]$response.StatusCode -ne 401)
+    }
+    catch {
+        if ($_.Exception.Response) {
+            return ([int]$_.Exception.Response.StatusCode.value__ -ne 401)
+        }
+        Fail (Zh "5peg5rOV6aqM6K+B6K++6aKY57uEIEFQSSBLZXnvvIzor7fmo4Dmn6XnvZHnu5zlkI7ph43or5XjgII=")
+    }
+}
+
+$zoteroWasRunning = $false
+$zoteroPath = $null
+$zoteroProcesses = @(Get-Process zotero -ErrorAction SilentlyContinue)
+if ($zoteroProcesses.Count -gt 0) {
+    $zoteroWasRunning = $true
+    $pathProcess = $zoteroProcesses |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_.Path) } |
+        Select-Object -First 1
+    if (-not $pathProcess) {
+        Fail (Zh "5peg5rOV6I635Y+WIFpvdGVybyDov5DooYzot6/lvoTvvIzor7fmiYvliqjlhbPpl63lkI7ph43or5XjgII=")
+    }
+    $zoteroPath = $pathProcess.Path
+
+    foreach ($process in $zoteroProcesses) {
+        if ($process.MainWindowHandle -ne 0) {
+            [void]$process.CloseMainWindow()
+        }
+    }
+
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Process zotero -ErrorAction SilentlyContinue) -and
+        (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+    }
+    if (Get-Process zotero -ErrorAction SilentlyContinue) {
+        Fail (Zh "5peg5rOV6Ieq5Yqo5YWz6ZetIFpvdGVyb++8jOivt+aJi+WKqOWFs+mXreWQjumHjeivleOAgg==")
+    }
 }
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -23,14 +67,14 @@ $scriptFiles = @(
 )
 foreach ($name in $scriptFiles) {
     if (-not (Test-Path (Join-Path $scriptsDir $name))) {
-        Fail ((Zh "57y65bCRIHNjcmlwdHNcezB944CC6K+36YeN5paw5LiL6L295bm25a6M5pW06Kej5Y6L5Y+R5biD5YyF44CC") -f $name)
+        Fail ((Zh "57y65bCRIHNjcmlwdHNcezB977yM6K+36YeN5paw5LiL6L295bm25a6M5pW06Kej5Y6L44CC") -f $name)
     }
 }
 
 $zoteroRoot = Join-Path $env:APPDATA "Zotero\Zotero"
 $profilesIni = Join-Path $zoteroRoot "profiles.ini"
 if (-not (Test-Path $profilesIni)) {
-    Fail (Zh "5pyq5om+5YiwIFpvdGVybyDphY3nva7mlofku7bjgILor7flhYjlronoo4Xlubboh7PlsJHlkK/liqjkuIDmrKEgWm90ZXJv44CC")
+    Fail (Zh "5pyq5om+5YiwIFpvdGVybyDphY3nva7vvIzor7flhYjlkK/liqjkuIDmrKEgWm90ZXJv44CC")
 }
 
 $profiles = @()
@@ -77,16 +121,25 @@ if (-not (Test-Path $pluginXpi) -and -not (Test-Path $pluginDir)) {
     Fail (Zh "5pyq5a6J6KOFIFpvdGVybyBBY3Rpb25zICYgVGFncyDmj5Lku7bjgII=")
 }
 
-$secureKey = Read-Host (Zh "6K+36L6T5YWl6K++6aKY57uEIEFQSSBLZXk=") -AsSecureString
-$ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
-try {
-    $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
-}
-finally {
-    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
-}
-if ([string]::IsNullOrWhiteSpace($apiKey)) {
-    Fail (Zh "QVBJIEtleSDkuI3og73kuLrnqbrjgII=")
+$apiKey = [Environment]::GetEnvironmentVariable(
+    "CHEN_GROUP_API_KEY_MEMBER",
+    [EnvironmentVariableTarget]::User
+)
+if (-not (Test-MemberKey $apiKey)) {
+    $secureKey = Read-Host (Zh "6K+36L6T5YWl6K++6aKY57uEIEFQSSBLZXk=") -AsSecureString
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
+    try {
+        $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+    }
+    if ([string]::IsNullOrWhiteSpace($apiKey)) {
+        Fail (Zh "QVBJIEtleSDkuI3og73kuLrnqbrjgII=")
+    }
+    if (-not (Test-MemberKey $apiKey)) {
+        Fail (Zh "QVBJIEtleSDml6DmlYjvvIzor7fph43mlrDovpPlhaXjgII=")
+    }
 }
 
 $syncMenu = [Text.Encoding]::UTF8.GetString(
@@ -252,6 +305,8 @@ foreach ($definition in $actions) {
     $apiKey,
     [EnvironmentVariableTarget]::User
 )
+$env:DOCUMENT2MD_PROFILE = "server"
+$env:CHEN_GROUP_API_KEY_MEMBER = $apiKey
 
 if ([Environment]::GetEnvironmentVariable(
     "DOCUMENT2MD_PROFILE",
@@ -266,5 +321,13 @@ if ([Environment]::GetEnvironmentVariable(
     Fail (Zh "5a6J6KOF5qCh6aqM5aSx6LSl77ya6K++6aKY57uEIEFQSSBLZXkg5pyq5q2j56Gu5YaZ5YWl55So5oi3546v5aKD5Y+Y6YeP44CC")
 }
 
-Write-Host (Zh "5a6J6KOF5a6M5oiQ44CC6K+36YeN5paw5omT5byAIFpvdGVyb++8jOWcqOKAnOaIkeeahOaWh+W6k+KAneS4reS9v+eUqOKAnOWQjOatpemZhOS7tuKAneOAgg==") -ForegroundColor Green
+if ($zoteroWasRunning) {
+    try {
+        Start-Process -FilePath $zoteroPath
+    }
+    catch {
+        Fail (Zh "5a6J6KOF5a6M5oiQ77yM5L2GIFpvdGVybyDoh6rliqjlkK/liqjlpLHotKXvvIzor7fmiYvliqjlkK/liqjjgII=")
+    }
+}
+Write-Host (Zh "5a6J6KOF5a6M5oiQ44CC5Y+v5ZyoIFpvdGVyb+KAnOaIkeeahOaWh+W6k+KAneS4reS9v+eUqOKAnOWQjOatpemZhOS7tuKAneOAgg==") -ForegroundColor Green
 
