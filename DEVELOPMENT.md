@@ -41,6 +41,52 @@
 8. ProgressWindow 使用 Zotero 默认点击关闭行为，不显式设置 `closeOnClick`。
 9. 修改后至少运行 `node --check`，并核对实际 Action 与源码一致。
 
+## 环境变量
+
+```text
+DOCUMENT2MD_PROFILE=local|server
+CHEN_GROUP_API_KEY=<开发者/Admin>
+CHEN_GROUP_API_KEY_MEMBER=<普通成员>
+```
+
+需要访问服务器的脚本优先读取 `CHEN_GROUP_API_KEY`，不存在时读取
+`CHEN_GROUP_API_KEY_MEMBER`。学生固定使用 `DOCUMENT2MD_PROFILE=server`。
+
+## 同步附件
+
+服务器接口：
+
+```text
+GET https://api.chen-group.cn/v1/attachments?doi=...
+PUT https://api.chen-group.cn/v1/attachments?doi=...&kind=pdf|bundle
+```
+
+- 只在个人库写入附件；Group Library 中执行会拒绝。
+- 服务器有缓存时复用 PDF、Markdown 和 FIG。
+- 缺 PDF 时由 paper-service 检索全文；缺 Markdown 时调用隐藏 `document2md`。
+- 本地生成而服务器缺失的 PDF/bundle 会上传；服务器缓存不由客户端覆盖或删除。
+- bundle 保持 Markdown 和 `d2md_fig_*` 原文件名。
+
+## 同步到课题组
+
+目标 Group ID 固定为 `6669851`。
+
+- citationkey 是条目匹配主键；缺失或群组中重复时跳过，不用标题猜测。
+- 新条目跨库复制并建立 linked-item 关系；保存前保留源 citationkey。
+- Collection 使用 linked-collection 关系保持重命名和移动后的对应关系。
+- 选条目时严格镜像该条目的元数据与 Tags；选 Collection 时严格镜像其子树、条目、Tags 和 membership。
+- Note、PDF、Markdown、FIG 均不进入 Group Library。
+- Better BibTeX `keyScope` 必须为 `library`。
+
+## document2md 与 UI
+
+- `document2md.js` 是唯一文档转 Markdown+FIG 实现。
+- `sync-attachments.js` 通过 `dispatchActionByKey()` 调用它。
+- 进度和汇总使用 `Zotero.ProgressWindow`。
+- 确认和选择使用 `Services.prompt`。
+- 不使用浏览器原生 `alert()`、`confirm()`、`prompt()`。
+- 一次性迁移或修复脚本完成并核验后不长期保留。
+
 ## 学生安装器
 
 `install.cmd` 调用 `installer.ps1`。安装器要求 Zotero 已关闭，并完成：
@@ -48,7 +94,8 @@
 1. 定位默认 Zotero Profile。
 2. 检查 Actions & Tags 是否已安装。
 3. 备份 `prefs.js`。
-4. 按固定 Action Key 安装或更新“同步附件”和隐藏 `document2md`。
+4. 按固定 Action Key 安装或更新“同步附件”和隐藏 `document2md`，并维护
+   `extensions.actionsTags.rules` 索引。
 5. 写入用户环境变量 `DOCUMENT2MD_PROFILE=server` 和 `CHEN_GROUP_API_KEY_MEMBER`。
 
 重复运行安装器会更新原 Action，不会创建重复 Action。

@@ -590,9 +590,14 @@ let activeBatch = null;
                     throw new Error("缺少 citationkey");
                 }
 
-                let pdf = await localPdf(literatureItem);
-                let markdown = await localMarkdown(literatureItem, pdf);
                 let changed = false;
+                let pdf = await localPdf(literatureItem);
+                if (pdf && pdf.getField("title") !== "PDF") {
+                    pdf.setField("title", "PDF");
+                    await pdf.saveTx();
+                    changed = true;
+                }
+                let markdown = await localMarkdown(literatureItem, pdf);
 
                 updateBatchProgress(
                     batch,
